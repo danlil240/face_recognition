@@ -1,3 +1,19 @@
+import os
+import sys
+from contextlib import contextmanager
+
+
+@contextmanager
+def suppress_stdout():
+    with open(os.devnull, "w") as devnull:
+        old_stdout = sys.stdout
+        sys.stdout = devnull
+        try:
+            yield
+        finally:
+            sys.stdout = old_stdout
+
+
 def calculate_iou(box1, box2):
     # Calculate the Intersection over Union of two boxes
     x1, y1, w1, h1 = box1

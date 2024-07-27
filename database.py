@@ -3,6 +3,7 @@ import numpy as np
 import logging
 import threading
 from contextlib import contextmanager
+import utils
 
 
 class FaceDatabase:
@@ -17,6 +18,7 @@ class FaceDatabase:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
             self._create_tables(conn)
+            self._migrate_database(conn)
 
     @contextmanager
     def _get_connection(self):
@@ -31,204 +33,143 @@ class FaceDatabase:
             """
             CREATE TABLE IF NOT EXISTS persons
             (id INTEGER PRIMARY KEY AUTOINCREMENT,
-             name TEXT);
-
-            CREATE TABLE IF NOT EXISTS embeddings
-            (id INTEGER PRIMARY KEY AUTOINCREMENT,
-             person_id INTEGER,
+             name TEXT,
              embedding BLOB,
-             weight REAL,
-             update_count INTEGER,
-             FOREIGN KEY(person_id) REFERENCES persons(id));
-        """
+             count INTEGER,
+             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP);
+            """
         )
 
-    def migrate_database(self):
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            try:
-                # Check if the update_count column exists
-                cursor.execute("PRAGMA table_info(embeddings)")
-                columns = [column[1] for column in cursor.fetchall()]
-
-                if "update_count" not in columns:
-                    # Add the update_count column
-                    cursor.execute(
-                        "ALTER TABLE embeddings ADD COLUMN update_count INTEGER DEFAULT 1"
-                    )
-                    conn.commit()
-                    logging.info("Added update_count column to embeddings table")
-            except Exception as e:
-                logging.error(f"Error migrating database: {e}")
-
-    def merge_persons(self, person_id1, person_id2):
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            try:
-                # Ensure person_id1 is the lower ID
-                if person_id1 > person_id2:
-                    person_id1, person_id2 = person_id2, person_id1
-
-                name1 = self.get_person_name(person_id1)
-                name2 = self.get_person_name(person_id2)
-
-                # Merge names if necessary
-                if name1 == name2:
-                    merged_name = name1
-                elif name1 and name2:
-                    merged_name = f"{name1}/{name2}"
-                else:
-                    merged_name = name1 or name2 or ""
-
-                cursor.execute(
-                    "UPDATE persons SET name = ? WHERE id = ?",
-                    (merged_name, person_id1),
-                )
-
-                # Fetch embeddings for both persons
-                cursor.execute(
-                    "SELECT embedding, weight, update_count FROM embeddings WHERE person_id IN (?, ?)",
-                    (person_id1, person_id2),
-                )
-                embeddings = cursor.fetchall()
-
-                # Combine embeddings
-                combined_embedding = np.zeros(512, dtype=np.float32)
-                total_weight = 0
-                total_count = 0
-
-                for emb, weight, count in embeddings:
-                    embedding_array = np.frombuffer(emb, dtype=np.float32)
-                    combined_embedding += embedding_array * weight
-                    total_weight += weight
-                    total_count += count
-
-                if total_weight > 0:
-                    combined_embedding /= total_weight
-                combined_embedding = combined_embedding / np.linalg.norm(
-                    combined_embedding
-                )
-                # Update the merged embedding
-                cursor.execute(
-                    """
-                    INSERT OR REPLACE INTO embeddings 
-                    (person_id, embedding, weight, update_count) 
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (
-                        person_id1,
-                        sqlite3.Binary(combined_embedding.tobytes()),
-                        total_weight,
-                        total_count,
-                    ),
-                )
-
-                # Delete the old person and their embeddings
-                cursor.execute(
-                    "DELETE FROM embeddings WHERE person_id = ?", (person_id2,)
-                )
-                cursor.execute("DELETE FROM persons WHERE id = ?", (person_id2,))
-
-                conn.commit()
-                logging.info(
-                    f"Persons {person_id1} and {person_id2} merged successfully."
-                )
-                return True
-            except Exception as e:
-                logging.error(f"Error merging persons: {e}")
-                conn.rollback()
-                return False
+    def _migrate_database(self, conn):
+        cursor = conn.cursor()
+        try:
+            cursor.execute("PRAGMA table_info(persons)")
+        except Exception as e:
+            logging.error(f"Error migrating database: {e}")
+            conn.rollback()
 
     def insert_person(self, embedding, name=None):
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("INSERT INTO persons (name) VALUES (?)", (name,))
+                embedding_bytes = embedding.astype(np.float32).tobytes()
+                cursor.execute(
+                    "INSERT INTO persons (name, embedding, count) VALUES (?, ?, ?)",
+                    (name, sqlite3.Binary(embedding_bytes), 1),
+                )
                 person_id = cursor.lastrowid
-                self.update_embedding(cursor, person_id, embedding, 1.0, 1)
                 conn.commit()
                 return person_id
         except sqlite3.Error as e:
             logging.error(f"Error inserting person: {e}")
             return None
 
-    def add_embedding(self, person_id, embedding):
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            try:
-                embedding_bytes = embedding.astype(np.float32).tobytes()
-                cursor.execute(
-                    "INSERT INTO embeddings (person_id, embedding) VALUES (?, ?)",
-                    (person_id, sqlite3.Binary(embedding_bytes)),
-                )
-                conn.commit()
-            except Exception as e:
-                logging.error(f"Error adding embedding: {e}")
-
-    def update_embedding(self, cursor, person_id, new_embedding, weight, update_count):
-        try:
-            new_embedding = new_embedding / np.linalg.norm(new_embedding)
-            embedding_bytes = new_embedding.astype(np.float32).tobytes()
-            cursor.execute(
-                """
-                INSERT OR REPLACE INTO embeddings 
-                (person_id, embedding, weight, update_count) 
-                VALUES (?, ?, ?, ?)
-            """,
-                (person_id, sqlite3.Binary(embedding_bytes), weight, update_count),
-            )
-            logging.info(f"Updated embedding for person ID: {person_id}")
-        except sqlite3.Error as e:
-            logging.error(f"Error updating embedding: {e}")
-
-    def get_person_embeddings(self, person_id):
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            try:
-                cursor.execute(
-                    "SELECT embedding FROM embeddings WHERE person_id = ?", (person_id,)
-                )
-                embeddings = []
-                for embedding in cursor.fetchall():
-                    try:
-                        e = np.frombuffer(embedding[0], dtype=np.float32)
-                        if e.shape == (512,):
-                            embeddings.append(e)
-                        else:
-                            logging.warning(
-                                f"Invalid embedding shape {e.shape} for person {person_id}"
-                            )
-                    except Exception as e:
-                        logging.error(
-                            f"Error processing embedding for person {person_id}: {e}"
-                        )
-                return embeddings
-            except Exception as e:
-                logging.error(f"Error fetching person embeddings: {e}")
-                return []
-
-    def get_person_embedding_info(self, person_id):
+    def update_embedding(self, person_id, new_embedding):
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    """
-                    SELECT embedding, weight, update_count 
-                    FROM embeddings 
-                    WHERE person_id = ?
-                """,
-                    (person_id,),
+                    "SELECT embedding, count FROM persons WHERE id = ?", (person_id,)
                 )
                 result = cursor.fetchone()
-                if result:
-                    return {
-                        "embedding": np.frombuffer(result[0], dtype=np.float32),
-                        "weight": result[1],
-                        "update_count": result[2],
-                    }
+                old_embedding = result[0]
+                count = result[1]
+                count += 1
+                if old_embedding is not None:
+                    old_embedding = np.frombuffer(old_embedding, dtype=np.float32)
+                new_embedding = 0.95 * old_embedding + 0.05 * new_embedding
+                new_embedding = utils.normalize_embedding(new_embedding)
+                embedding_bytes = new_embedding.astype(np.float32).tobytes()
+                cursor.execute(
+                    "UPDATE persons SET embedding = ?, count = ?, timestamp = CURRENT_TIMESTAMP WHERE id = ?",
+                    (sqlite3.Binary(embedding_bytes), count, person_id),
+                )
+                conn.commit()
+        except sqlite3.Error as e:
+            logging.error(f"Error updating embedding: {e}")
+
+    def merge_persons(self, person1_id, person2_id):
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                if person1_id > person2_id:
+                    temp1 = person1_id
+                    person1_id = person2_id
+                    person2_id = temp1
+                # Fetch data for both persons
+                cursor.execute(
+                    "SELECT name, embedding, count FROM persons WHERE id IN (?, ?)",
+                    (person1_id, person2_id),
+                )
+                results = cursor.fetchall()
+
+                if len(results) != 2:
+                    logging.error(
+                        f"Could not find both persons with IDs {person1_id} and {person2_id}"
+                    )
+                    return False
+
+                person1_data, person2_data = results
+                person1_name, person1_embedding, person1_count = person1_data
+                person2_name, person2_embedding, person2_count = person2_data
+
+                # Decide which name to keep
+                if person1_name and person2_name:
+                    return
+
+                merged_name = person1_name if person1_name else person2_name
+
+                # Combine embeddings
+                if person1_embedding and person2_embedding:
+                    embedding1 = np.frombuffer(person1_embedding, dtype=np.float32)
+                    embedding2 = np.frombuffer(person2_embedding, dtype=np.float32)
+                    merged_embedding = (
+                        embedding1 * person1_count + embedding2 * person2_count
+                    )
+                    merged_embedding = utils.normalize_embedding(merged_embedding)
+                    merged_embedding = merged_embedding.astype(np.float32)
+                else:
+                    merged_embedding = person1_embedding or person2_embedding
+
+                # Update person1 with merged data
+                cursor.execute(
+                    "UPDATE persons SET name = ?, embedding = ?, count = ?, timestamp = CURRENT_TIMESTAMP WHERE id = ?",
+                    (
+                        merged_name,
+                        sqlite3.Binary(merged_embedding.tobytes()),
+                        person1_count + person2_count,
+                        person1_id,
+                    ),
+                )
+
+                # Delete person2
+                cursor.execute("DELETE FROM persons WHERE id = ?", (person2_id,))
+
+                # Commit the changes
+                conn.commit()
+
+                logging.info(
+                    f"Successfully merged persons {person1_id} and {person2_id}"
+                )
+                return True
+
+        except sqlite3.Error as e:
+            logging.error(f"Error merging persons: {e}")
+            return False
+
+    def get_person_embedding(self, person_id):
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT embedding FROM persons WHERE id = ?", (person_id,)
+                )
+                result = cursor.fetchone()
+                if result and result[0]:
+                    return np.frombuffer(result[0], dtype=np.float32)
                 return None
         except sqlite3.Error as e:
-            logging.error(f"Error fetching person embedding info: {e}")
+            logging.error(f"Error fetching person embedding: {e}")
             return None
 
     def get_all_persons(self):
@@ -252,12 +193,24 @@ class FaceDatabase:
             logging.error(f"Error fetching person name: {e}")
             return None
 
+    def get_person_count(self, person_id):
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT count FROM persons WHERE id = ?", (person_id,))
+                result = cursor.fetchone()
+                return result[0] if result else None
+        except sqlite3.Error as e:
+            logging.error(f"Error fetching person name: {e}")
+            return None
+
     def update_person_name(self, person_id, name):
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    "UPDATE persons SET name = ? WHERE id = ?", (name, person_id)
+                    "UPDATE persons SET name = ?, timestamp = CURRENT_TIMESTAMP WHERE id = ?",
+                    (name, person_id),
                 )
                 conn.commit()
         except sqlite3.Error as e:
@@ -267,45 +220,61 @@ class FaceDatabase:
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute(
-                    "DELETE FROM embeddings WHERE person_id = ?", (person_id,)
-                )
                 cursor.execute("DELETE FROM persons WHERE id = ?", (person_id,))
                 conn.commit()
         except sqlite3.Error as e:
             logging.error(f"Error deleting person: {e}")
 
+    def clean_old_low_count_entries(self):
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+
+                # Delete entries older than 20 seconds with count less than 15
+                cursor.execute(
+                    """
+                    DELETE FROM persons 
+                    WHERE julianday('now') - julianday(timestamp) > 20.0 / 86400.0
+                    AND count < 15
+                """
+                )
+
+                deleted_count = cursor.rowcount
+                conn.commit()
+                if deleted_count > 0:
+                    logging.info(
+                        f"Cleaned {deleted_count} entries older than 20 seconds with count less than 15."
+                    )
+                return deleted_count
+
+        except sqlite3.Error as e:
+            logging.error(f"Error cleaning old entries with low count: {e}")
+            return 0
+
     def clean_database(self):
         with self._get_connection() as conn:
             cursor = conn.cursor()
             try:
-                # Remove embeddings that can't be converted to numpy arrays
-                cursor.execute("SELECT id, embedding FROM embeddings")
+                cursor.execute("SELECT id, embedding FROM persons")
                 invalid_ids = []
                 for row in cursor.fetchall():
-                    embedding_id, embedding_bytes = row
-                    try:
-                        np.frombuffer(embedding_bytes, dtype=np.float32)
-                    except:
-                        invalid_ids.append(embedding_id)
+                    person_id, embedding_bytes = row
+                    if embedding_bytes is None:
+                        invalid_ids.append(person_id)
+                    else:
+                        try:
+                            np.frombuffer(embedding_bytes, dtype=np.float32)
+                        except:
+                            invalid_ids.append(person_id)
 
                 if invalid_ids:
                     placeholders = ",".join("?" for _ in invalid_ids)
                     cursor.execute(
-                        f"DELETE FROM embeddings WHERE id IN ({placeholders})",
-                        invalid_ids,
+                        f"DELETE FROM persons WHERE id IN ({placeholders})", invalid_ids
                     )
 
-                # Remove persons with no associated embeddings
-                cursor.execute(
-                    """
-                    DELETE FROM persons 
-                    WHERE id NOT IN (SELECT DISTINCT person_id FROM embeddings)
-                """
-                )
-
                 conn.commit()
-                removed_count = len(invalid_ids) + cursor.rowcount
+                removed_count = len(invalid_ids)
                 logging.info(
                     f"Cleaned database. Removed {removed_count} invalid entries."
                 )
@@ -319,25 +288,11 @@ class FaceDatabase:
         with self._get_connection() as conn:
             cursor = conn.cursor()
             try:
-                # Delete all data from the tables
-                cursor.execute("DELETE FROM embeddings")
-                cursor.execute("DELETE FROM persons")
-
-                # Reset the auto-increment counters
-                cursor.execute(
-                    "DELETE FROM sqlite_sequence WHERE name='embeddings' OR name='persons'"
-                )
-
-                # Commit the changes
+                cursor.execute("DROP TABLE IF EXISTS persons")
                 conn.commit()
-
-                # Vacuum the database to reclaim freed space and reset internal IDs
-                conn.execute("VACUUM")
-
-                logging.info(
-                    "Database reset successfully. All data has been erased and IDs reset."
-                )
-                return True
-            except Exception as e:
+                self._create_tables(conn)
+                conn.commit()
+                logging.info("Database reset successfully.")
+            except sqlite3.Error as e:
                 logging.error(f"Error resetting database: {e}")
-                return False
+                conn.rollback()

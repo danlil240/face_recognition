@@ -6,52 +6,13 @@ from database import FaceDatabase
 from face_recognition import FaceRecognizer
 from video_processor import AdvancedVideoProcessor
 from typing import List, Tuple, Any
-from database_management_gui import DatabaseManagementGUI  # Import the new GUI class
+from database_management_gui import DatabaseManagementGUI
+from tracked_face import TrackedFace
+
 
 logging.basicConfig(
     level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s"
 )
-
-
-class TrackedFace:
-    def __init__(self, face_id, bbox, name=None):
-        self.face_id = face_id
-        self.bbox = bbox
-        self.name = name
-        self.velocity = np.array([0, 0])
-        self.last_seen = 0
-        now = time.time()
-        self.predict_t = now
-        self.update_t = now
-        self.last_center = np.array([bbox[0] + bbox[2] / 2, bbox[1] + bbox[3] / 2])
-
-    def update(self, bbox):
-        now = time.time()
-        dt = now - self.update_t
-        self.update_t = now
-        self.predict_t = self.update_t
-        new_center = np.array([bbox[0] + bbox[2] / 2, bbox[1] + bbox[3] / 2])
-
-        self.velocity = (new_center - self.last_center) / dt
-        self.bbox = bbox
-        self.last_seen = 0
-        self.last_center = new_center
-
-    def predict(self):
-        now = time.time()
-        dt = now - self.predict_t
-        self.predict_t = now
-        center = np.array(
-            [self.bbox[0] + self.bbox[2] / 2, self.bbox[1] + self.bbox[3] / 2]
-        )
-        new_center = center + self.velocity * dt
-        self.bbox = (
-            int(new_center[0] - self.bbox[2] / 2),
-            int(new_center[1] - self.bbox[3] / 2),
-            self.bbox[2],
-            self.bbox[3],
-        )
-        self.last_seen += 1
 
 
 class FaceRecognitionApp:
@@ -66,6 +27,7 @@ class FaceRecognitionApp:
         self.input_text = ""
         self.show_textbox = False
         self.db_gui = DatabaseManagementGUI(database, recognizer)
+        self.refresh_data_interval = 20
 
     def run(self):
         cap = cv2.VideoCapture(0)
@@ -78,7 +40,8 @@ class FaceRecognitionApp:
                 ret, frame = cap.read()
                 if not ret:
                     break
-
+                if frame_count % self.refresh_data_interval == 0:
+                    self.recognizer.refresh_data()
                 if frame_count % self.recognition_interval == 0:
                     self.video_processor.add_frame(frame.copy())
                     results = self.video_processor.get_results()
@@ -169,18 +132,12 @@ class FaceRecognitionApp:
 
     def handle_keyboard_input(self):
         key = cv2.waitKey(1) & 0xFF
-        if key == ord("q"):
-            return "quit"
-        elif key == ord("d") and not self.selected_face:
-            self.open_database_gui()
-        elif self.selected_face:
+
+        if self.selected_face:
             if key == 13:  # Enter key
                 if self.input_text:
                     self.selected_face.name = self.input_text
                     self.database.update_person_name(
-                        self.selected_face.face_id, self.input_text
-                    )
-                    self.recognizer.update_person_name(
                         self.selected_face.face_id, self.input_text
                     )
                 self.selected_face = None
@@ -194,10 +151,11 @@ class FaceRecognitionApp:
                 self.input_text = self.input_text[:-1]
             elif 32 <= key <= 126:  # Printable ASCII characters
                 self.input_text += chr(key)
+        elif key == ord("q"):
+            return "quit"
+        elif key == ord("d"):
+            self.db_gui.start()
         return "continue"
-
-    def open_database_gui(self):
-        self.db_gui.start()
 
 
 def main():

@@ -79,7 +79,6 @@ class DatabaseManagementGUI:
         new_name = simpledialog.askstring("Update Name", "Enter new name:")
         if new_name:
             self.database.update_person_name(person_id, new_name)
-            self.recognizer.update_person_name(person_id, new_name)
             self.refresh_data()
 
     def delete_person(self):

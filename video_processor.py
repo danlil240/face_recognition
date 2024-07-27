@@ -15,7 +15,7 @@ class AdvancedVideoProcessor:
         self,
         recognizer: FaceRecognizer,
         database: FaceDatabase,
-        recognition_threads: int = 4,
+        recognition_threads: int = 1,
     ):
         self.recognizer = recognizer
         self.database = database
@@ -70,7 +70,7 @@ class AdvancedVideoProcessor:
 
                 end_time = time.time()
                 duration = end_time - start_time
-                # logging.debug(f"Recognition took {duration:.4f} seconds")
+                logging.debug(f"Recognition took {duration:.4f} seconds")
 
             except queue.Empty:
                 continue

@@ -48,18 +48,33 @@ class FaceDatabase:
             logging.error(f"Error migrating database: {e}")
             conn.rollback()
 
+    def _get_lowest_available_id(self, conn):
+        cursor = conn.cursor()
+        cursor.execute("SELECT id FROM persons ORDER BY id")
+        used_ids = set(row[0] for row in cursor.fetchall())
+
+        # Find the lowest available ID
+        lowest_id = 1
+        while lowest_id in used_ids:
+            lowest_id += 1
+
+        return lowest_id
+
     def insert_person(self, embedding, name=None):
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 embedding_bytes = embedding.astype(np.float32).tobytes()
+
+                # Get the lowest available ID
+                lowest_id = self._get_lowest_available_id(conn)
+
                 cursor.execute(
-                    "INSERT INTO persons (name, embedding, count) VALUES (?, ?, ?)",
-                    (name, sqlite3.Binary(embedding_bytes), 1),
+                    "INSERT INTO persons (id, name, embedding, count) VALUES (?, ?, ?, ?)",
+                    (lowest_id, name, sqlite3.Binary(embedding_bytes), 1),
                 )
-                person_id = cursor.lastrowid
                 conn.commit()
-                return person_id
+                return lowest_id
         except sqlite3.Error as e:
             logging.error(f"Error inserting person: {e}")
             return None

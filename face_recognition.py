@@ -2,7 +2,6 @@ import numpy as np
 from deepface import DeepFace
 from sklearn.metrics.pairwise import cosine_similarity
 import logging
-from functools import lru_cache
 import utils
 from database import FaceDatabase
 import threading
@@ -15,13 +14,9 @@ class FaceRecognizer:
         self.database = database
         self.similarity_threshold = 0.6
         self.improvement_threshold = 0.8
-        self.max_embeddings = 5
         self.merge_threshold = 0.6
-        self.embedding_cache = {}
-        self.max_update_count = 100
         DeepFace.build_model("Facenet512")
 
-    # @lru_cache(maxsize=100)
     def process_face(self, face_img):
         try:
             out_embedding = DeepFace.represent(
@@ -82,40 +77,11 @@ class FaceRecognizer:
                 self.database.update_embedding(
                     best_match_id, processed_embedding.flatten()
                 )
-            self.auto_merge_similar_persons()
-            self.database.clean_old_low_count_entries()
             return best_match_id, self.database.get_person_name(best_match_id)
 
-    # def update_embedding(self, person_id, new_embedding, similarity):
-    #     embedding_info = self.database.get_person_embedding(person_id)
-    #     if embedding_info:
-    #         stored_embedding = embedding_info
-    #         stored_weight = embedding_info["weight"]
-    #         update_count = min(
-    #             embedding_info["update_count"] + 1, self.max_update_count
-    #         )
-
-    #         # Calculate new weight based on similarity and update count
-    #         new_weight = similarity * (1 / update_count)
-
-    #         # Update the weighted average of the embedding
-    #         updated_embedding = (
-    #             stored_embedding * stored_weight + new_embedding * new_weight
-    #         ) / (stored_weight + new_weight)
-    #         updated_weight = stored_weight + new_weight
-
-    #         # Normalize the updated embedding
-    #         normalized_embedding = updated_embedding / np.linalg.norm(updated_embedding)
-
-    #         self.database.update_embedding(
-    #             person_id, normalized_embedding, updated_weight, update_count
-    #         )
-    #         logging.info(f"Updated embedding for person ID: {person_id}")
-
-    @lru_cache(maxsize=100)
-    def get_person_embeddings(self, person_id):
-        embeddings = self.database.get_person_embeddings(person_id)
-        return embeddings
+    def refresh_data(self):
+        self.auto_merge_similar_persons()
+        self.database.clean_old_low_count_entries()
 
     def find_similar_persons(self):
         persons = self.database.get_all_persons()
@@ -143,7 +109,6 @@ class FaceRecognizer:
         merged_count = 0
 
         if not similar_pairs:
-            # logging.debug("No similar persons found for merging.")
             return merged_count
 
         for id1, id2, similarity in similar_pairs:
@@ -167,42 +132,3 @@ class FaceRecognizer:
 
         logging.info(f"Total merges performed: {merged_count}")
         return merged_count
-
-    # def real_time_merge(self, recognized_person_id, embedding, database):
-    #     persons = database.get_all_persons()
-    #     for other_id, _ in persons:
-    #         if other_id != recognized_person_id:
-    #             other_embedding_info = database.get_person_embedding(other_id)
-    #             if other_embedding_info:
-    #                 similarity = cosine_similarity(embedding, other_embedding_info)
-    #                 if similarity > self.merge_threshold:
-    #                     database.merge_persons(recognized_person_id, other_id)
-    #                     logging.info(
-    #                         f"Merged person {other_id} into {recognized_person_id}"
-    #                     )
-    #                     return True
-    #     return False
-
-    def adjust_thresholds(self):
-        person_count = len(self.database.get_all_persons())
-        if person_count > 100:
-            self.similarity_threshold = 0.65
-            self.merge_threshold = 0.75
-        elif person_count > 50:
-            self.similarity_threshold = 0.62
-            self.merge_threshold = 0.72
-        else:
-            self.similarity_threshold = 0.6
-            self.merge_threshold = 0.7
-        logging.info(
-            f"Adjusted thresholds: similarity={self.similarity_threshold}, merge={self.merge_threshold}"
-        )
-
-    def update_person_name(self, person_id, new_name):
-        # Update any internal caches or data structures
-        if person_id in self.embedding_cache:
-            del self.embedding_cache[person_id]
-        # You might need to update other internal data structures here
-        logging.info(
-            f"Updated name for person {person_id} to {new_name} in FaceRecognizer"
-        )
